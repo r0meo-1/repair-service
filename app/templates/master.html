@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Master Panel - {{ user.username }}</h2>
+<p class="text-muted">Your assigned requests</p>
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Client</th>
+      <th>Phone</th>
+      <th>Address</th>
+      <th>Problem</th>
+      <th>Status</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in requests %}
+  <tr>
+    <td>{{ r.id }}</td>
+    <td>{{ r.clientName }}</td>
+    <td>{{ r.phone }}</td>
+    <td>{{ r.address }}</td>
+    <td>{{ r.problemText[:50] }}</td>
+    <td><span class="badge bg-secondary">{{ r.status.value }}</span></td>
+    <td>
+      {% if r.status.value == 'assigned' %}
+      <form method="post" action="/master/take/{{ r.id }}" class="d-inline">
+        <button class="btn btn-sm btn-success">Take</button>
+      </form>
+      {% endif %}
+      {% if r.status.value == 'in_progress' %}
+      <form method="post" action="/master/done/{{ r.id }}" class="d-inline">
+        <button class="btn btn-sm btn-primary">Mark Done</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if not requests %}
+<div class="alert alert-info">No requests assigned to you yet.</div>
+{% endif %}
+{% endblock %}
