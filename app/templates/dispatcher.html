@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Dispatcher Panel</h2>
+<div class="mb-3">
+  <form method="get" class="d-flex gap-2">
+    <select name="status" class="form-select w-auto">
+      <option value="">All statuses</option>
+      {% for s in statuses %}
+      <option value="{{ s }}" {% if s == current_status %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn btn-secondary" type="submit">Filter</button>
+  </form>
+</div>
+<table class="table table-striped">
+  <thead><tr><th>#</th><th>Client</th><th>Phone</th><th>Address</th><th>Problem</th><th>Status</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for r in requests %}
+  <tr>
+    <td>{{ r.id }}</td>
+    <td>{{ r.clientName }}</td>
+    <td>{{ r.phone }}</td>
+    <td>{{ r.address }}</td>
+    <td>{{ r.problemText[:50] }}</td>
+    <td><span class="badge bg-secondary">{{ r.status.value }}</span></td>
+    <td>
+      {% if r.status.value == 'new' or r.status.value == 'assigned' %}
+      <form method="post" action="/dispatcher/assign/{{ r.id }}" class="d-inline">
+        <select name="master_id" class="form-select form-select-sm d-inline w-auto">
+          {% for m in masters %}<option value="{{ m.id }}">{{ m.username }}</option>{% endfor %}
+        </select>
+        <button class="btn btn-sm btn-primary">Assign</button>
+      </form>
+      {% endif %}
+      {% if r.status.value != 'canceled' and r.status.value != 'done' %}
+      <form method="post" action="/dispatcher/cancel/{{ r.id }}" class="d-inline">
+        <button class="btn btn-sm btn-danger">Cancel</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
