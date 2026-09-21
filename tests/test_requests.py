@@ -1,97 +1,105 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from app.main import app, get_db
-from app.models import Base, User
-from passlib.context import CryptContext
 
-TEST_DB_URL = 'sqlite:///./test.db'
-engine = create_engine(TEST_DB_URL, connect_args={'check_same_thread': False})
-TestingSession = sessionmaker(bind=engine)
-pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
+from app.main import app
+from app.models import Request as ServiceRequest, StatusEnum, User
 
 
-def override_get_db():
-    db = TestingSession()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-@pytest.fixture(autouse=True)
-def setup_db():
-    Base.metadata.create_all(bind=engine)
-    db = TestingSession()
-    dispatcher = User(username='disp', password_hash=pwd_context.hash('pass123'), role='dispatcher')
-    master = User(username='mstr', password_hash=pwd_context.hash('pass123'), role='master')
-    db.add(dispatcher)
-    db.add(master)
-    db.commit()
-    db.close()
-    app.dependency_overrides[get_db] = override_get_db
-    yield
-    Base.metadata.drop_all(bind=engine)
-    app.dependency_overrides.clear()
-
-
-client = TestClient(app, raise_server_exceptions=False)
-
-
-def login(username, password):
-    r = client.post('/login', data={'username': username, 'password': password}, follow_redirects=False)
-    return r
-
-
-def test_create_request():
-    login('disp', 'pass123')
-    r = client.post(
-        '/requests/new',
-        data={
-            'clientName': 'Test Client',
-            'phone': '1234567890',
-            'address': 'Test Address',
-            'problemText': 'Test Problem'
-        },
-        follow_redirects=False
+def login(client, username):
+    response = client.post(
+        "/login", data={"username": username, "password": "pass123"},
+        follow_redirects=False,
     )
-    assert r.status_code in [200, 302, 303]
+    assert response.status_code == 302
 
 
-def test_race_condition_take():
-    import threading
-    login('disp', 'pass123')
-    client.post(
-        '/requests/new',
-        data={
-            'clientName': 'Race Client',
-            'phone': '9999999999',
-            'address': 'Race Address',
-            'problemText': 'Race Problem'
-        },
-        follow_redirects=False
+def create_request(client, database):
+    response = client.post("/", data={
+        "clientName": "Test Client", "phone": "1234567890",
+        "address": "Test Address", "problemText": "Test Problem",
+    })
+    assert response.status_code == 200
+    with database() as db:
+        request = db.query(ServiceRequest).one()
+        assert request.status == StatusEnum.new
+        assert request.assignedTo is None
+        assert request.problemText == "Test Problem"
+        return request.id
+
+
+def assign_request(client, database, request_id):
+    login(client, "disp")
+    with database() as db:
+        master_id = db.query(User).filter_by(username="mstr").one().id
+    response = client.post(
+        f"/dispatcher/assign/{request_id}", data={"master_id": master_id},
+        follow_redirects=False,
     )
-    db = TestingSession()
-    from app.models import Request
-    req = db.query(Request).filter(Request.clientName == 'Race Client').first()
-    req_id = req.r_id
-    db.close()
+    assert response.status_code == 302
+    with database() as db:
+        request = db.get(ServiceRequest, request_id)
+        assert request.status == StatusEnum.assigned
+        assert request.assignedTo == master_id
 
-    results = []
 
-    def take_request():
-        login('mstr', 'pass123')
-        r = client.post(f'/master/take/{req_id}', follow_redirects=False)
-        results.append(r.status_code)
+def test_public_create_request(client, database):
+    create_request(client, database)
 
-    threads = [threading.Thread(target=take_request) for _ in range(5)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
 
-    db = TestingSession()
-    req = db.query(Request).get(req_id)
-    assert req.status.value in ['in_progress', 'assigned']
-    db.close()
+def test_assigned_master_lifecycle(client, database):
+    request_id = create_request(client, database)
+    assign_request(client, database, request_id)
+    login(client, "mstr")
+    response = client.post(f"/master/take/{request_id}", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == "/master"
+    with database() as db:
+        assert db.get(ServiceRequest, request_id).status == StatusEnum.in_progress
+    assert client.post(f"/master/take/{request_id}").status_code == 409
+    response = client.post(f"/master/done/{request_id}", follow_redirects=False)
+    assert response.status_code == 302
+    with database() as db:
+        assert db.get(ServiceRequest, request_id).status == StatusEnum.done
+
+
+@pytest.mark.parametrize("route,success", [("api/requests", 200), ("master", 302)])
+def test_concurrent_take_has_exactly_one_winner(client, database, route, success):
+    request_id = create_request(client, database)
+    assign_request(client, database, request_id)
+    barrier = Barrier(5)
+
+    def take_request(_):
+        # Each worker gets its own cookie jar and DB session.
+        with TestClient(app) as worker:
+            if route == "master":
+                login(worker, "mstr")
+            barrier.wait(timeout=15)
+            return worker.post(
+                f"/api/requests/{request_id}/take" if route == "api/requests"
+                else f"/master/take/{request_id}",
+                follow_redirects=False,
+            ).status_code
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(take_request, range(5)))
+    assert sorted(results) == [success, 409, 409, 409, 409]
+    with database() as db:
+        assert db.get(ServiceRequest, request_id).status == StatusEnum.in_progress
+
+
+def test_unassigned_request_cannot_be_taken(client, database):
+    request_id = create_request(client, database)
+    assert client.post(f"/api/requests/{request_id}/take").status_code == 409
+    with database() as db:
+        assert db.get(ServiceRequest, request_id).status == StatusEnum.new
+
+
+def test_master_actions_require_login(client, database):
+    request_id = create_request(client, database)
+    for action in ("take", "done"):
+        assert client.post(f"/master/{action}/{request_id}").status_code == 403
+    with database() as db:
+        assert db.get(ServiceRequest, request_id).status == StatusEnum.new
