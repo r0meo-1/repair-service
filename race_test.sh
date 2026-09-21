@@ -1,21 +1,33 @@
 #!/bin/bash
-# Race condition test - sends 10 parallel take requests for request ID 1
-# Usage: ./race_test.sh [request_id]
+# Usage: ./race_test.sh request_id cookie_jar
+# The cookie jar must belong to the assigned master; request must be assigned.
+set -euo pipefail
+REQUEST_ID=${1:?Provide an assigned request ID}
+COOKIE_JAR=${2:?Provide the assigned master login cookie jar}
+URL=${BASE_URL:-http://localhost:8000}
+[[ "$REQUEST_ID" =~ ^[1-9][0-9]*$ && -f "$COOKIE_JAR" ]] || exit 2
 
-REQUEST_ID=${1:-1}
-URL="http://localhost:8000"
-
-echo "=== Race Condition Test ==="
-echo "Sending 10 parallel take requests for request #$REQUEST_ID"
-
-for i in $(seq 1 10); do
-  curl -s -o /dev/null -w "Thread $i: HTTP %{http_code}\n" \
-    -X POST "$URL/master/take/$REQUEST_ID" \
-    --cookie-jar /tmp/cookie_$i.txt \
-    -c /tmp/cookie_$i.txt &
+results=$(mktemp -d)
+trap 'rm -rf -- "$results"' EXIT
+pids=()
+for i in {1..10}; do
+  curl --silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code}' \
+    --cookie "$COOKIE_JAR" -X POST "$URL/api/requests/$REQUEST_ID/take" > "$results/$i" &
+  pids+=("$!")
 done
-
-wait
-echo "=== Done ==="
-echo "Checking final request status:"
-curl -s "$URL/api/requests/$REQUEST_ID" | python3 -m json.tool 2>/dev/null || echo "Check the dispatcher panel to see status"
+failed=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || failed=1
+done
+success=0
+conflicts=0
+for i in {1..10}; do
+  code=$(cat "$results/$i")
+  echo "Request $i: HTTP $code"
+  case "$code" in
+    200) success=$((success + 1));;
+    409) conflicts=$((conflicts + 1));;
+    *) failed=1;;
+  esac
+done
+[[ "$failed" == 0 && "$success" == 1 && "$conflicts" == 9 ]]

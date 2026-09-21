@@ -3,7 +3,10 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import update
+from starlette.middleware.sessions import SessionMiddleware
 import bcrypt
+import os
+import secrets
 
 from app.database import get_db, engine
 from app.models import Base, User, Request as ServiceRequest, StatusEnum, RoleEnum
@@ -11,14 +14,35 @@ from app.models import Base, User, Request as ServiceRequest, StatusEnum, RoleEn
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Repair Service")
+session_secret = os.getenv("SESSION_SECRET") or secrets.token_urlsafe(32)
+if len(session_secret) < 32:
+    raise RuntimeError("SESSION_SECRET must contain at least 32 characters")
+app.add_middleware(
+    SessionMiddleware, secret_key=session_secret, max_age=8 * 60 * 60,
+    same_site="lax", https_only=os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true",
+)
 templates = Jinja2Templates(directory="app/templates")
 
 
 def get_current_user(request: Request, db: Session = Depends(get_db)):
-    user_id = request.cookies.get("user_id")
-    if not user_id:
+    user_id = request.session.get("user_id")
+    if type(user_id) is not int or not 0 < user_id <= 2**63 - 1:
         return None
-    return db.query(User).filter(User.id == int(user_id)).first()
+    return db.get(User, user_id)
+
+
+def transition_request(db, req_id, allowed, target, *, owner_id=None, **values):
+    if db.get(ServiceRequest, req_id) is None:
+        raise HTTPException(status_code=404)
+    statement = update(ServiceRequest).where(
+        ServiceRequest.id == req_id, ServiceRequest.status.in_(allowed),
+    )
+    if owner_id is not None:
+        statement = statement.where(ServiceRequest.assignedTo == owner_id)
+    result = db.execute(statement.values(status=target, **values))
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=409, detail="Request unavailable or wrong status")
 
 
 @app.get("/")
@@ -67,12 +91,15 @@ def login(
         url="/dispatcher" if user.role == RoleEnum.dispatcher else "/master",
         status_code=302,
     )
-    resp.set_cookie("user_id", str(user.id))
+    request.session.clear()
+    request.session["user_id"] = user.id
+    resp.delete_cookie("user_id")
     return resp
 
 
 @app.get("/logout")
-def logout():
+def logout(request: Request):
+    request.session.clear()
     resp = RedirectResponse(url="/login", status_code=302)
     resp.delete_cookie("user_id")
     return resp
@@ -109,12 +136,11 @@ def assign_master(
     user = get_current_user(request, db)
     if not user or user.role != RoleEnum.dispatcher:
         raise HTTPException(status_code=403)
-    req = db.query(ServiceRequest).filter(ServiceRequest.id == req_id).first()
-    if not req:
-        raise HTTPException(status_code=404)
-    req.assignedTo = master_id
-    req.status = StatusEnum.assigned
-    db.commit()
+    master = db.get(User, master_id)
+    if not master or master.role != RoleEnum.master:
+        raise HTTPException(status_code=400, detail="Select an existing master")
+    transition_request(db, req_id, [StatusEnum.new, StatusEnum.assigned],
+                       StatusEnum.assigned, assignedTo=master.id)
     return RedirectResponse(url="/dispatcher", status_code=302)
 
 
@@ -125,11 +151,8 @@ def cancel_request(
     user = get_current_user(request, db)
     if not user or user.role != RoleEnum.dispatcher:
         raise HTTPException(status_code=403)
-    req = db.query(ServiceRequest).filter(ServiceRequest.id == req_id).first()
-    if not req:
-        raise HTTPException(status_code=404)
-    req.status = StatusEnum.canceled
-    db.commit()
+    transition_request(db, req_id, [StatusEnum.new, StatusEnum.assigned, StatusEnum.in_progress],
+                       StatusEnum.canceled)
     return RedirectResponse(url="/dispatcher", status_code=302)
 
 
@@ -154,17 +177,8 @@ def take_request(req_id: int, request: Request, db: Session = Depends(get_db)):
     user = get_current_user(request, db)
     if not user or user.role != RoleEnum.master:
         raise HTTPException(status_code=403)
-    result = db.execute(
-        update(ServiceRequest)
-        .where(
-            ServiceRequest.id == req_id,
-            ServiceRequest.status == StatusEnum.assigned,
-        )
-        .values(status=StatusEnum.in_progress)
-    )
-    db.commit()
-    if result.rowcount == 0:
-        raise HTTPException(status_code=409, detail="Request already taken or wrong status")
+    transition_request(db, req_id, [StatusEnum.assigned], StatusEnum.in_progress,
+                       owner_id=user.id)
     return RedirectResponse(url="/master", status_code=302)
 
 
@@ -173,25 +187,16 @@ def done_request(req_id: int, request: Request, db: Session = Depends(get_db)):
     user = get_current_user(request, db)
     if not user or user.role != RoleEnum.master:
         raise HTTPException(status_code=403)
-    req = db.query(ServiceRequest).filter(ServiceRequest.id == req_id).first()
-    if not req:
-        raise HTTPException(status_code=404)
-    req.status = StatusEnum.done
-    db.commit()
+    transition_request(db, req_id, [StatusEnum.in_progress], StatusEnum.done,
+                       owner_id=user.id)
     return RedirectResponse(url="/master", status_code=302)
 
 
 @app.post("/api/requests/{req_id}/take")
-def api_take_request(req_id: int, db: Session = Depends(get_db)):
-    result = db.execute(
-        update(ServiceRequest)
-        .where(
-            ServiceRequest.id == req_id,
-            ServiceRequest.status == StatusEnum.assigned,
-        )
-        .values(status=StatusEnum.in_progress)
-    )
-    db.commit()
-    if result.rowcount == 0:
-        raise HTTPException(status_code=409, detail="Conflict: already taken")
+def api_take_request(req_id: int, request: Request, db: Session = Depends(get_db)):
+    user = get_current_user(request, db)
+    if not user or user.role != RoleEnum.master:
+        raise HTTPException(status_code=403)
+    transition_request(db, req_id, [StatusEnum.assigned], StatusEnum.in_progress,
+                       owner_id=user.id)
     return {"status": "ok"}

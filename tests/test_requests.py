@@ -74,8 +74,7 @@ def test_concurrent_take_has_exactly_one_winner(client, database, route, success
     def take_request(_):
         # Each worker gets its own cookie jar and DB session.
         with TestClient(app) as worker:
-            if route == "master":
-                login(worker, "mstr")
+            login(worker, "mstr")
             barrier.wait(timeout=15)
             return worker.post(
                 f"/api/requests/{request_id}/take" if route == "api/requests"
@@ -92,6 +91,7 @@ def test_concurrent_take_has_exactly_one_winner(client, database, route, success
 
 def test_unassigned_request_cannot_be_taken(client, database):
     request_id = create_request(client, database)
+    login(client, "mstr")
     assert client.post(f"/api/requests/{request_id}/take").status_code == 409
     with database() as db:
         assert db.get(ServiceRequest, request_id).status == StatusEnum.new

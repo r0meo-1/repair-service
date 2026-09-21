@@ -9,6 +9,8 @@ services:
       - ./data:/app/data
     environment:
       - DATABASE_URL=sqlite:///./data/repair.db
+      - SESSION_SECRET=${SESSION_SECRET:-}
+      - SESSION_HTTPS_ONLY=${SESSION_HTTPS_ONLY:-false}
     command: >-
       sh -c "python seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     restart: unless-stopped
